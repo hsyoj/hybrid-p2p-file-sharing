@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <sys/stat.h>
 
@@ -21,6 +22,7 @@ static inline void sleep(unsigned int x) { Sleep(x * 1000); }
 #include <unistd.h>
 #include <pthread.h>
 #include <arpa/inet.h>
+#include <sys/time.h>
 #define Tfunc void *
 #define THandle pthread_t
 #define TNcode NULL
@@ -113,14 +115,21 @@ Tfunc tTCPServer(void *args)
     ssock = socket(AF_INET, SOCK_STREAM, 0);
     if (ssock < 0)
         return TEcode;
+    memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family = AF_INET;
     saddr.sin_addr.s_addr = INADDR_ANY;
     saddr.sin_port = htons(TCPSerPort);
 
     if (bind(ssock, (sockaddr *)&saddr, sizeof(saddr)) < 0)
+    {
+        closes(ssock);
         return TEcode;
+    }
     if (listen(ssock, 5) < 0)
+    {
+        closes(ssock);
         return TEcode;
+    }
 
     while (TCPSStat)
     {
@@ -133,8 +142,14 @@ Tfunc tTCPServer(void *args)
         if (!startThread(&subsh, dealRequest, tsock))
         {
             free(tsock);
+            closes(csock);
             continue;
         }
+#ifdef _WIN32
+        CloseHandle(subsh);
+#else
+        pthread_detach(subsh);
+#endif
     }
 
     return TNcode;
@@ -147,17 +162,19 @@ Tfunc dealRequest(void *psock)
     char buffer[BUFFER_SIZE];
     char tfname[141] = {0};
     char filename[161] = {0};
-    size_t bytes_read;
+    int n;
 
-    bytes_read = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_read <= 0)
+    n = (int)recv(sock, buffer, sizeof(buffer) - 1, 0);
+    if (n <= 0)
     {
         closes(sock);
         return TEcode;
     }
-    buffer[bytes_read] = '\0';
+    buffer[n] = '\0';
 
-    if (sscanf(buffer, "GET %s", tfname) != 1)
+    /* Only plain file names inside the shared folder may be requested. */
+    if (sscanf(buffer, "GET %140s", tfname) != 1 || strstr(tfname, "..") != NULL ||
+        strchr(tfname, '/') != NULL || strchr(tfname, '\\') != NULL)
     {
         const char *error_message = "ERR BRQ\n";
         send(sock, error_message, strlen(error_message), 0);
@@ -182,17 +199,29 @@ Tfunc dealRequest(void *psock)
         closes(sock);
         return TEcode;
     }
-    size_t file_size = file_stat.st_size;
 
-    snprintf(buffer, sizeof(buffer), "OK %llu\n", (ull)file_size);
-    send(sock, buffer, strlen(buffer), 0);
-    while ((bytes_read = fread(buffer, 1, BUFFER_SIZE, file)) > 0)
+    snprintf(buffer, sizeof(buffer), "OK %llu\n", (ull)file_stat.st_size);
+    if (send(sock, buffer, strlen(buffer), 0) < 0)
     {
-        if (send(sock, buffer, bytes_read, 0) < 0)
+        fclose(file);
+        closes(sock);
+        return TEcode;
+    }
+
+    size_t nread;
+    while ((nread = fread(buffer, 1, BUFFER_SIZE, file)) > 0)
+    {
+        size_t off = 0;
+        while (off < nread)
         {
-            fclose(file);
-            closes(sock);
-            return TEcode;
+            int s = (int)send(sock, buffer + off, nread - off, 0);
+            if (s <= 0)
+            {
+                fclose(file);
+                closes(sock);
+                return TEcode;
+            }
+            off += (size_t)s;
         }
     }
 
@@ -206,12 +235,14 @@ int sendRequest(int port, const char *filename)
     int sock;
     sockaddr_in saddr;
     char buffer[BUFFER_SIZE];
-    size_t bytes_read;
-    FILE *file = NULL;
+    int n;
+    int result = 0;
+
     sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0)
         return -1;
 
+    memset(&saddr, 0, sizeof(saddr));
     saddr.sin_family = AF_INET;
     saddr.sin_port = htons(port);
     if (inet_pton(AF_INET, "127.0.0.1", &saddr.sin_addr) <= 0)
@@ -233,13 +264,32 @@ int sendRequest(int port, const char *filename)
         return -4;
     }
 
-    bytes_read = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    if (bytes_read <= 0)
+    /* Read the header line ("OK <size>\n" or "ERR ...\n"). The first recv may
+     * also contain the start of the file body, so keep whatever follows the '\n'. */
+    size_t hlen = 0;
+    char *nl = NULL;
+    while (hlen < sizeof(buffer) - 1)
+    {
+        n = (int)recv(sock, buffer + hlen, sizeof(buffer) - 1 - hlen, 0);
+        if (n <= 0)
+        {
+            closes(sock);
+            return -5;
+        }
+        hlen += (size_t)n;
+        buffer[hlen] = '\0';
+        nl = (char *)memchr(buffer, '\n', hlen);
+        if (nl)
+            break;
+    }
+    if (!nl)
     {
         closes(sock);
         return -5;
     }
-    buffer[bytes_read] = '\0';
+    *nl = '\0';
+    size_t body_off = (size_t)(nl - buffer) + 1;
+    size_t extra = hlen - body_off;
 
     if (strncmp(buffer, "OK ", 3) == 0)
     {
@@ -249,39 +299,57 @@ int sendRequest(int port, const char *filename)
             closes(sock);
             return -11;
         }
-        size_t file_size = tfsize;
 
-        char file_path[151] = {0};
+        char file_path[171] = {0};
         snprintf(file_path, sizeof(file_path), "%s/%s", homedir, filename);
 
-        file = fopen(file_path, "wb");
+        FILE *file = fopen(file_path, "wb");
         if (!file)
         {
             closes(sock);
             return -12;
         }
 
-        size_t remaining = file_size;
-        while (remaining > 0 && (bytes_read = recv(sock, buffer, BUFFER_SIZE, 0)) > 0)
+        ull remaining = tfsize;
+        if (extra > 0)
         {
-            fwrite(buffer, 1, bytes_read, file);
-            remaining -= bytes_read;
+            size_t w = (ull)extra > remaining ? (size_t)remaining : extra;
+            fwrite(buffer + body_off, 1, w, file);
+            remaining -= w;
         }
+        while (remaining > 0 && (n = (int)recv(sock, buffer, BUFFER_SIZE, 0)) > 0)
+        {
+            size_t w = (ull)n > remaining ? (size_t)remaining : (size_t)n;
+            fwrite(buffer, 1, w, file);
+            remaining -= w;
+        }
+        fclose(file);
+        closes(sock);
         if (remaining > 0)
+        {
+            remove(file_path);
             return -21;
-        else
-            return 0;
+        }
+        return 0;
     }
     elif (strncmp(buffer, "ERR BRQ", 7) == 0)
+    {
         fprintf(stderr, "[Error] Bad request.\n");
+        result = -31;
+    }
     elif (strncmp(buffer, "ERR FNF", 7) == 0)
+    {
         fprintf(stderr, "[Error] File not found.\n");
-    else fprintf(stderr, "[Error] Unknown response from server.\n");
+        result = -32;
+    }
+    else
+    {
+        fprintf(stderr, "[Error] Unknown response from peer.\n");
+        result = -33;
+    }
 
-    if (file)
-        fclose(file);
     closes(sock);
-    return 0;
+    return result;
 }
 
 void closes(int sock)
@@ -381,9 +449,11 @@ int genPort()
 
 int strPort(const char *str)
 {
+    if (*str == '\0' || strlen(str) > 5)
+        return -1;
     for (int i = 0; str[i] != '\0'; i++)
     {
-        if (!isdigit(str[i]))
+        if (!isdigit((unsigned char)str[i]))
             return -1;
     }
     int port = atoi(str);
@@ -415,7 +485,7 @@ bool udpSendMsg(int sock, const char *msg)
     saddr.sin_family = AF_INET;
     saddr.sin_port = htons(ServerPort);
     saddr.sin_addr.s_addr = inet_addr(ServerIP);
-    size_t sent_len = sendto(sock, msg, strlen(msg), 0, (sockaddr *)&saddr, sizeof(saddr));
+    int sent_len = (int)sendto(sock, msg, strlen(msg), 0, (sockaddr *)&saddr, sizeof(saddr));
     if (sent_len < 0)
     {
         fprintf(stderr, "[Error] Failed to send message\n");
@@ -434,9 +504,9 @@ bool udpReceiveMsg(int sock, char *buffer, size_t buffer_size)
 {
     struct sockaddr_in raddr;
     socklen_t raddr_len = sizeof(raddr);
-    size_t recv_len;
+    int recv_len;
 
-    recv_len = recvfrom(sock, buffer, buffer_size - 1, 0, (struct sockaddr *)&raddr, &raddr_len);
+    recv_len = (int)recvfrom(sock, buffer, buffer_size - 1, 0, (struct sockaddr *)&raddr, &raddr_len);
     if (recv_len < 0)
     {
         fprintf(stderr, "[Error] Failed to receive message\n");
@@ -523,7 +593,7 @@ void sendLap(int sock)
 
 void sendSch(int sock, const char *substr)
 {
-    char msg[151] = {0};
+    char msg[200] = {0};
     char response[BUFFER_SIZE] = {0};
 
     snprintf(msg, sizeof(msg), "SCH %s %s\n", uname, substr);
@@ -590,7 +660,7 @@ void sendPub(int sock, const char *filename)
         return;
     }
 
-    char msg[151] = {0};
+    char msg[200] = {0};
     char response[BUFFER_SIZE] = {0};
 
     snprintf(msg, sizeof(msg), "PUB %s %s\n", uname, filename);
@@ -618,7 +688,7 @@ void sendPub(int sock, const char *filename)
 
 void sendUnp(int sock, const char *filename)
 {
-    char msg[151] = {0};
+    char msg[200] = {0};
     char response[BUFFER_SIZE] = {0};
 
     snprintf(msg, sizeof(msg), "UNP %s %s\n", uname, filename);
@@ -666,7 +736,6 @@ void sendLpf(int sock)
         fprintf(stderr, "[Warning] The server actively disconnected.\n");
         return;
     }
-    printf("[recv] %s\n", response);
     if (strncmp(response, "OK ", 3) == 0)
     {
         const char *result_list = response + 3;
@@ -705,7 +774,7 @@ void sendLpf(int sock)
 
 void sendGet(int sock, const char *filename)
 {
-    char msg[151] = {0};
+    char msg[200] = {0};
     char response[BUFFER_SIZE] = {0};
 
     snprintf(msg, sizeof(msg), "GET %s %s\n", uname, filename);
@@ -786,7 +855,9 @@ bool startThread(THandle *thread, tFuncType tf, void *args)
 
 void clear_stdin() 
 {
-    while (getchar() != '\n' && getchar() != EOF);
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF)
+        ;
 }
 
 void startCli(int sersock)
@@ -799,12 +870,17 @@ void startCli(int sersock)
             char pass[17] = {0};
             char user[17] = {0};
             printf("Enter username: ");
-            scanf("%16s", user);
+            if (scanf("%16s", user) != 1)
+                return;
             printf("Enter password: ");
-            scanf("%16s", pass);
+            if (scanf("%16s", pass) != 1)
+                return;
             TCPSerPort = genPort();
             if (sendATH(sersock, user, pass, TCPSerPort))
             {
+                /* The heartbeat thread reads uname, so set it before the thread starts. */
+                strcpy(uname, user);
+                sprintf(homedir, "./%.16s", uname);
                 HBStat = true;
                 TCPSStat = true;
                 if (!startThread(&thHB, tHeartbeats, NULL))
@@ -817,10 +893,8 @@ void startCli(int sersock)
                     fprintf(stderr, "[Fatal] Failed to start the TCP server thread.\n");
                     return;
                 }
-                strcpy(uname, user);
-                sprintf(homedir, "./%.16s", uname);
                 Auth = true;
-                printf("Welcome to BitTrickle!\nAvailable commands are: get, lap, lpf, pub, sch, unp, xit\n");
+                printf("Welcome to PeerShare!\nAvailable commands are: get, lap, lpf, pub, sch, unp, xit\n");
             }
             else
                 printf("Authentication failed. Please try again.\n");
@@ -829,29 +903,34 @@ void startCli(int sersock)
         char cmd[151] = {0};
         char substr[141] = {0};
         printf("> ");
-        scanf("%s", cmd);
+        if (scanf("%150s", cmd) != 1)
+            return;
         if (strncmp(cmd, "lap", 3) == 0)
             sendLap(sersock);
         elif (strncmp(cmd, "sch", 3) == 0)
         {
-            scanf("%s", substr);
+            if (scanf("%140s", substr) != 1)
+                return;
             sendSch(sersock, substr);
         }
         elif (strncmp(cmd, "pub", 3) == 0)
         {
-            scanf("%s", substr);
+            if (scanf("%140s", substr) != 1)
+                return;
             sendPub(sersock, substr);
         }
         elif (strncmp(cmd, "unp", 3) == 0)
         {
-            scanf("%s", substr);
+            if (scanf("%140s", substr) != 1)
+                return;
             sendUnp(sersock, substr);
         }
         elif (strncmp(cmd, "lpf", 3) == 0)
             sendLpf(sersock);
         elif (strncmp(cmd, "get", 3) == 0)
         {
-            scanf("%s", substr);
+            if (scanf("%140s", substr) != 1)
+                return;
             sendGet(sersock, substr);
         }
         elif (strncmp(cmd, "xit", 3) == 0)
@@ -871,8 +950,9 @@ int main(int argc, char **argv)
         fprintf(stderr, "[Fatal] Please input Server Port.\n");
         return 1;
     }
-    ServerPort = strPort(argv[1]);
-    if (ServerPort == -1)
+    int sp = strPort(argv[1]);
+    ServerPort = (unsigned)sp;
+    if (sp < 0)
     {
         fprintf(stderr, "[Fatal] Invalid Port.\n");
         return 1;
@@ -886,6 +966,14 @@ int main(int argc, char **argv)
     ssock = socket(AF_INET, SOCK_DGRAM, 0);
     if (ssock < 0)
         return 1;
+    /* Do not block forever if the server never answers (UDP has no delivery guarantee). */
+#ifdef _WIN32
+    DWORD rcvtmo = 5000;
+    setsockopt(ssock, SOL_SOCKET, SO_RCVTIMEO, (const char *)&rcvtmo, sizeof(rcvtmo));
+#else
+    struct timeval rcvtmo = {5, 0};
+    setsockopt(ssock, SOL_SOCKET, SO_RCVTIMEO, &rcvtmo, sizeof(rcvtmo));
+#endif
     startCli(ssock);
     HBStat = false;
     TCPSStat = false;
